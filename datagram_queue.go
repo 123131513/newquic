@@ -18,16 +18,22 @@ type datagramQueue struct {
 	dequeued chan struct{}
 
 	logger utils.Logger
+	// zzh: add retransmissionQueue
+	retransmissionQueue    chan *wire.DatagramFrame
+	retransmissionDequeued chan struct{}
+	packetBuffer           *PacketBuffer
 }
 
 func newDatagramQueue(hasData func(), logger utils.Logger) *datagramQueue {
 	return &datagramQueue{
-		hasData:   hasData,
-		sendQueue: make(chan *wire.DatagramFrame, 1),
-		rcvQueue:  make(chan []byte, protocol.DatagramRcvQueueLen),
-		dequeued:  make(chan struct{}),
-		closed:    make(chan struct{}),
-		logger:    logger,
+		hasData:                hasData,
+		sendQueue:              make(chan *wire.DatagramFrame, 1),
+		rcvQueue:               make(chan []byte, protocol.DatagramRcvQueueLen),
+		dequeued:               make(chan struct{}),
+		closed:                 make(chan struct{}),
+		logger:                 logger,
+		retransmissionQueue:    make(chan *wire.DatagramFrame, 1),
+		retransmissionDequeued: make(chan struct{}),
 	}
 }
 
@@ -49,9 +55,30 @@ func (h *datagramQueue) AddAndWait(f *wire.DatagramFrame) error {
 	}
 }
 
+// zzh: AddToRetransmissionQueue adds a DATAGRAM frame to the retransmission queue.
+// AddToRetransmissionQueue adds a DATAGRAM frame to the retransmission queue.
+func (h *datagramQueue) AddToRetransmissionQueue(f *wire.DatagramFrame) error {
+	select {
+	case h.retransmissionQueue <- f:
+		h.hasData()
+	case <-h.closed:
+		return h.closeErr
+	}
+
+	select {
+	case <-h.retransmissionDequeued:
+		return nil
+	case <-h.closed:
+		return h.closeErr
+	}
+}
+
 // Get dequeues a DATAGRAM frame for sending.
 func (h *datagramQueue) Get() *wire.DatagramFrame {
 	select {
+	case f := <-h.retransmissionQueue:
+		h.retransmissionDequeued <- struct{}{}
+		return f
 	case f := <-h.sendQueue:
 		h.dequeued <- struct{}{}
 		return f

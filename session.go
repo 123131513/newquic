@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
 	"sync"
 	"time"
 
@@ -49,6 +50,111 @@ type handshakeEvent struct {
 type closeError struct {
 	err    error
 	remote bool
+}
+
+// zzh: add PacketBufferPool
+// PacketInfo stores metadata about each packet.
+type PacketInfo struct {
+	IsStart         bool
+	IsEnd           bool
+	SequenceID      int
+	Processed       bool
+	Packetsize      int
+	BlockSize       int
+	BlockSequenceID int
+}
+
+// PacketBuffer manages packets and their metadata.
+type PacketBuffer struct {
+	mu              sync.Mutex
+	sequence_buffer map[int]PacketInfo
+	data_buffer     map[int]*DatagramFrame
+	frameToInfo     map[*DatagramFrame]PacketInfo
+	timers          map[int]*time.Timer
+}
+
+// NewPacketBuffer creates a new PacketBuffer.
+func NewPacketBuffer() *PacketBuffer {
+	return &PacketBuffer{
+		sequence_buffer: make(map[int]PacketInfo),
+		data_buffer:     make(map[int]*DatagramFrame),
+		frameToInfo:     make(map[*DatagramFrame]PacketInfo),
+		timers:          make(map[int]*time.Timer),
+	}
+}
+
+// AddPacket adds a packet and its metadata to the buffer.
+func (pb *PacketBuffer) AddPacket(frame *DatagramFrame, info PacketInfo) {
+	pb.mu.Lock()
+	defer pb.mu.Unlock()
+
+	// 添加数据包到缓冲区
+	pb.sequence_buffer[info.SequenceID] = info
+	pb.data_buffer[info.SequenceID] = frame
+	pb.frameToInfo[frame] = info
+
+	if info.IsEnd {
+		timer := time.AfterFunc(1*time.Second, func() {
+			pb.clearBlock(info.BlockSequenceID)
+		})
+		pb.timers[info.BlockSequenceID] = timer
+	}
+
+	// 打开或创建日志文件
+	file, err := os.OpenFile("quic_log.txt", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		fmt.Printf("Error opening log file: %v\n", err)
+		return
+	}
+	defer file.Close()
+
+	// 写入数据包信息到日志文件
+	logEntry := fmt.Sprintf("SequenceID: %d, IsStart: %t, IsEnd: %t, Packetsize: %d, BlockSize: %d, BlockStartSequenceID: %d\n",
+		info.SequenceID, info.IsStart, info.IsEnd, info.Packetsize, info.BlockSize, info.BlockSequenceID)
+	if _, err := file.WriteString(logEntry); err != nil {
+		fmt.Printf("Error writing to log file: %v\n", err)
+	}
+}
+
+// GetPacket retrieves a packet and its metadata from the buffer.
+func (pb *PacketBuffer) GetPacket(sequenceID int) (*DatagramFrame, PacketInfo, error) {
+	frame, dataExists := pb.data_buffer[sequenceID]
+	info, infoExists := pb.sequence_buffer[sequenceID]
+	if !dataExists || !infoExists {
+		return nil, PacketInfo{}, errors.New("packet not found")
+	}
+	return frame, info, nil
+}
+
+func (pb *PacketBuffer) GetPacketInfoByFrame(frame *DatagramFrame) (PacketInfo, error) {
+	pb.mu.Lock()
+	defer pb.mu.Unlock()
+
+	info, exists := pb.frameToInfo[frame]
+	if !exists {
+		return PacketInfo{}, fmt.Errorf("packet info for frame not found")
+	}
+
+	return info, nil
+}
+
+func (pb *PacketBuffer) clearBlock(blockSequenceID int) {
+	pb.mu.Lock()
+	defer pb.mu.Unlock()
+
+	for seqID, info := range pb.sequence_buffer {
+		if info.BlockSequenceID == blockSequenceID {
+			delete(pb.data_buffer, seqID)
+			delete(pb.sequence_buffer, seqID)
+		}
+	}
+
+	if timer, exists := pb.timers[blockSequenceID]; exists {
+		timer.Stop()
+		delete(pb.timers, blockSequenceID)
+	}
+
+	fmt.Printf("Cleared block with BlockSequenceID: %d\n", blockSequenceID)
 }
 
 // A Session is a QUIC session
@@ -132,6 +238,12 @@ type session struct {
 	MaxDatagramFrameSize protocol.ByteCount
 	// zzh: add the logger
 	logger utils.Logger
+	// zzh: add packet buffer
+	packetBuffer                *PacketBuffer
+	sequenceID                  int  // 添加序列ID字段
+	nextIsStart                 bool // 添加标记字段
+	currentBlockSize            int  // 当前块的大小
+	currentBlockStartSequenceID int  // 当前块的起始序号
 }
 
 var _ Session = &session{}
@@ -220,6 +332,11 @@ func (s *session) setup(
 	if s.config.EnableDatagrams {
 		s.MaxDatagramFrameSize = protocol.MaxDatagramFrameSize
 		s.datagramQueue = newDatagramQueue(s.scheduleSending, s.logger)
+		s.packetBuffer = NewPacketBuffer()
+		s.sequenceID = 0
+		s.nextIsStart = false
+		s.currentBlockSize = 0
+		s.currentBlockStartSequenceID = 0
 	}
 
 	s.scheduler = &scheduler{
@@ -1011,13 +1128,66 @@ func (s *session) Getdeadlinestatus() time.Duration {
 
 // zzh: datagram interface
 func (s *session) SendMessage(p []byte) error {
+	// 检查是否是块结束标记
+	if string(p) == "BLOCK_END" {
+		fmt.Printf("Block end marker detected \n")
+		if s.sequenceID > 0 {
+			lastSequenceID := s.sequenceID - 1
+			if frame, info, err := s.packetBuffer.GetPacket(lastSequenceID); err == nil {
+				info.IsEnd = true
+				info.BlockSize = s.currentBlockSize
+				info.BlockSequenceID = s.currentBlockStartSequenceID
+				s.packetBuffer.AddPacket(frame, info)
+			}
+		}
+		// 重置块大小和起始序号
+		s.currentBlockSize = 0
+		// s.currentBlockStartSequenceID = s.sequenceID
+		// 设置下一个数据包为开头
+		s.nextIsStart = true
+		// 跳过块结束标记，继续读取下一个数据包
+		return nil
+	}
+
+	// 创建 PacketInfo
+	packetInfo := PacketInfo{
+		IsStart:         s.sequenceID == 0 || s.nextIsStart, // 序列号为0的数据包为开头
+		IsEnd:           false,
+		SequenceID:      s.sequenceID,
+		Processed:       false,
+		BlockSize:       0,
+		Packetsize:      len(p),
+		BlockSequenceID: s.currentBlockStartSequenceID,
+	}
+
+	// 重置 nextIsStart 标记
+	// 如果是块的开头，递增序列号并记录起始序号
+	if s.nextIsStart {
+		s.currentBlockStartSequenceID++
+		s.nextIsStart = false
+		packetInfo.BlockSequenceID = s.currentBlockStartSequenceID
+	}
+
 	f := &wire.DatagramFrame{DataLenPresent: true}
+	// fmt.Println("datagram frame size: ", f.MaxDataLen(s.MaxDatagramFrameSize, s.version))
+	// fmt.Println("datagram frame size: ", protocol.ByteCount(len(p)))
 	if protocol.ByteCount(len(p)) > f.MaxDataLen(s.MaxDatagramFrameSize, s.version) {
 		return errors.New("message too large")
 	}
 	f.Data = make([]byte, len(p))
 	copy(f.Data, p)
+
+	// 添加数据包到 PacketBuffer
+	s.packetBuffer.AddPacket(f, packetInfo)
+
 	s.datagramQueue.AddAndWait(f)
+
+	// 更新当前块的大小
+	s.currentBlockSize += len(p)
+
+	// 递增序列ID
+	s.sequenceID++
+
 	return nil
 }
 
