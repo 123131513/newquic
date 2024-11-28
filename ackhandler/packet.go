@@ -35,6 +35,22 @@ func (p *Packet) GetFramesForRetransmission() []wire.Frame {
 	return fs
 }
 
+// zzh: get all frames for ack
+// GetFramesForRetransmission gets all the frames for retransmission
+func (p *Packet) GetFramesForACK() []wire.Frame {
+	var fs []wire.Frame
+	for _, frame := range p.Frames {
+		switch frame.(type) {
+		case *wire.AckFrame:
+			continue
+		case *wire.StopWaitingFrame:
+			continue
+		}
+		fs = append(fs, frame)
+	}
+	return fs
+}
+
 func (p *Packet) IsRetransmittable() bool {
 	for _, f := range p.Frames {
 		switch f.(type) {

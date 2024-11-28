@@ -185,25 +185,25 @@ func (h *sentPacketHandler) SentPacket(packet *Packet) error {
 	return nil
 }
 
-func (h *sentPacketHandler) ReceivedAck(ackFrame *wire.AckFrame, withPacketNumber protocol.PacketNumber, rcvTime time.Time) error {
+func (h *sentPacketHandler) ReceivedAck(ackFrame *wire.AckFrame, withPacketNumber protocol.PacketNumber, rcvTime time.Time) ([]*PacketElement, error) {
 	if ackFrame.LargestAcked > h.lastSentPacketNumber {
-		return errAckForUnsentPacket
+		return nil, errAckForUnsentPacket
 	}
 
 	// duplicate or out-of-order ACK
 	if withPacketNumber <= h.largestReceivedPacketWithAck {
-		return ErrDuplicateOrOutOfOrderAck
+		return nil, ErrDuplicateOrOutOfOrderAck
 	}
 	h.largestReceivedPacketWithAck = withPacketNumber
 
 	// ignore repeated ACK (ACKs that don't have a higher LargestAcked than the last ACK)
 	if ackFrame.LargestAcked <= h.largestInOrderAcked() {
-		return nil
+		return nil, nil
 	}
 	h.LargestAcked = ackFrame.LargestAcked
 
 	if h.skippedPacketsAcked(ackFrame) {
-		return ErrAckForSkippedPacket
+		return nil, ErrAckForSkippedPacket
 	}
 
 	rttUpdated := h.maybeUpdateRTT(ackFrame.LargestAcked, ackFrame.DelayTime, rcvTime)
@@ -212,25 +212,35 @@ func (h *sentPacketHandler) ReceivedAck(ackFrame *wire.AckFrame, withPacketNumbe
 		h.congestion.MaybeExitSlowStart()
 	}
 
+	Packets := make([]*PacketElement, 1024)
+	// fmt.Println("determineNewlyAckedPackets before")
 	ackedPackets, err := h.determineNewlyAckedPackets(ackFrame)
 	if err != nil {
-		return err
+		fmt.Println("determineNewlyAckedPackets error")
+		return Packets, err
 	}
 
 	if len(ackedPackets) > 0 {
+		copy(Packets, ackedPackets)
+		if len(Packets) > 0 {
+			fmt.Println("ackedPackets: not nil")
+		} else {
+			fmt.Println("ackedPackets: nil")
+		}
 		for _, p := range ackedPackets {
 			h.onPacketAcked(p)
 			h.congestion.OnPacketAcked(p.Value.PacketNumber, p.Value.Length, h.bytesInFlight)
 		}
 	}
 
+	fmt.Println("ackedPackets after len: ", len(ackedPackets))
 	h.detectLostPackets()
 	h.updateLossDetectionAlarm()
 
 	h.garbageCollectSkippedPackets()
 	h.stopWaitingManager.ReceivedAck(ackFrame)
 
-	return nil
+	return Packets, nil
 }
 
 func (h *sentPacketHandler) ReceivedClosePath(f *wire.ClosePathFrame, withPacketNumber protocol.PacketNumber, rcvTime time.Time) error {

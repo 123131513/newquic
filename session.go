@@ -67,24 +67,30 @@ type PacketInfo struct {
 // PacketBuffer manages packets and their metadata.
 type PacketBuffer struct {
 	mu              sync.Mutex
+	mr              sync.Mutex
+	s               *session
 	sequence_buffer map[int]PacketInfo
-	data_buffer     map[int]*DatagramFrame
-	frameToInfo     map[*DatagramFrame]PacketInfo
+	data_buffer     map[int]*wire.DatagramFrame
+	frameToInfo     map[*wire.DatagramFrame]PacketInfo
 	timers          map[int]*time.Timer
+	retranstimers   map[int]*time.Timer
 }
 
 // NewPacketBuffer creates a new PacketBuffer.
-func NewPacketBuffer() *PacketBuffer {
+func NewPacketBuffer(s *session) *PacketBuffer {
 	return &PacketBuffer{
+		s:               s,
 		sequence_buffer: make(map[int]PacketInfo),
-		data_buffer:     make(map[int]*DatagramFrame),
-		frameToInfo:     make(map[*DatagramFrame]PacketInfo),
+		data_buffer:     make(map[int]*wire.DatagramFrame),
+		frameToInfo:     make(map[*wire.DatagramFrame]PacketInfo),
 		timers:          make(map[int]*time.Timer),
+		retranstimers:   make(map[int]*time.Timer),
 	}
 }
 
 // AddPacket adds a packet and its metadata to the buffer.
-func (pb *PacketBuffer) AddPacket(frame *DatagramFrame, info PacketInfo) {
+func (pb *PacketBuffer) AddPacket(frame *wire.DatagramFrame, info PacketInfo) {
+	fmt.Println("AddPacket")
 	pb.mu.Lock()
 	defer pb.mu.Unlock()
 
@@ -93,11 +99,16 @@ func (pb *PacketBuffer) AddPacket(frame *DatagramFrame, info PacketInfo) {
 	pb.data_buffer[info.SequenceID] = frame
 	pb.frameToInfo[frame] = info
 
+	fmt.Println("AddPacket  2")
 	if info.IsEnd {
-		timer := time.AfterFunc(1*time.Second, func() {
+		timer := time.AfterFunc(10000*time.Millisecond, func() {
 			pb.clearBlock(info.BlockSequenceID)
 		})
 		pb.timers[info.BlockSequenceID] = timer
+		retranstimers := time.AfterFunc(80*time.Millisecond, func() {
+			pb.RetransmissionBlock(info.BlockSequenceID)
+		})
+		pb.retranstimers[info.BlockSequenceID] = retranstimers
 	}
 
 	// 打开或创建日志文件
@@ -116,9 +127,24 @@ func (pb *PacketBuffer) AddPacket(frame *DatagramFrame, info PacketInfo) {
 	}
 }
 
+// AddPacket adds a packet and its metadata to the buffer.
+func (pb *PacketBuffer) Refreshinfonolog(frame *wire.DatagramFrame, info PacketInfo) {
+	pb.mu.Lock()
+	defer pb.mu.Unlock()
+
+	// 添加数据包到缓冲区
+	pb.sequence_buffer[info.SequenceID] = info
+	pb.frameToInfo[frame] = info
+}
+
 // GetPacket retrieves a packet and its metadata from the buffer.
-func (pb *PacketBuffer) GetPacket(sequenceID int) (*DatagramFrame, PacketInfo, error) {
+func (pb *PacketBuffer) GetPacket(sequenceID int) (*wire.DatagramFrame, PacketInfo, error) {
+	fmt.Println("GetPacket")
+	pb.mu.Lock()
+	defer pb.mu.Unlock()
+
 	frame, dataExists := pb.data_buffer[sequenceID]
+	fmt.Println("GetPacket 2")
 	info, infoExists := pb.sequence_buffer[sequenceID]
 	if !dataExists || !infoExists {
 		return nil, PacketInfo{}, errors.New("packet not found")
@@ -126,11 +152,13 @@ func (pb *PacketBuffer) GetPacket(sequenceID int) (*DatagramFrame, PacketInfo, e
 	return frame, info, nil
 }
 
-func (pb *PacketBuffer) GetPacketInfoByFrame(frame *DatagramFrame) (PacketInfo, error) {
+func (pb *PacketBuffer) GetPacketInfoByFrame(frame *wire.DatagramFrame) (PacketInfo, error) {
+	fmt.Println("GetPacketInfoByFrame")
 	pb.mu.Lock()
 	defer pb.mu.Unlock()
 
 	info, exists := pb.frameToInfo[frame]
+	fmt.Println("GetPacketInfoByFrame 2")
 	if !exists {
 		return PacketInfo{}, fmt.Errorf("packet info for frame not found")
 	}
@@ -155,6 +183,41 @@ func (pb *PacketBuffer) clearBlock(blockSequenceID int) {
 	}
 
 	fmt.Printf("Cleared block with BlockSequenceID: %d\n", blockSequenceID)
+}
+
+func (pb *PacketBuffer) RetransmissionBlock(blockSequenceID int) {
+	pb.mu.Lock()
+	defer pb.mu.Unlock()
+
+	for seqID, info := range pb.sequence_buffer {
+		// for _, info := range pb.sequence_buffer {
+		if info.BlockSequenceID == blockSequenceID && !info.Processed {
+			fmt.Printf(" Retransmission frame with SequenceID: %d\n", info.SequenceID)
+			// _, exists := pb.data_buffer[seqID]
+			frame, exists := pb.data_buffer[seqID]
+			if !exists {
+				fmt.Printf("Frame not found in data_buffer for SequenceID: %d\n", seqID)
+				continue
+			}
+			pb.s.datagramQueue.AddToRetransmissionQueue(frame)
+			fmt.Printf(" Retransmission block with BlockSequenceID: %d\n", blockSequenceID)
+			info.Processed = true
+		}
+		if info.BlockSequenceID > blockSequenceID || (info.IsEnd && info.BlockSequenceID == blockSequenceID) {
+			break
+		}
+	}
+
+	// 重置重传计时器
+	if timer, exists := pb.retranstimers[blockSequenceID]; exists {
+		timer.Stop()
+		// delete(pb.retranstimers, blockSequenceID)
+	}
+	// retranstimer := time.AfterFunc(60*time.Millisecond, func() {
+	// 	pb.RetransmissionBlock(blockSequenceID)
+	// })
+	// pb.retranstimers[blockSequenceID] = retranstimer
+
 }
 
 // A Session is a QUIC session
@@ -331,8 +394,8 @@ func (s *session) setup(
 	// zzh: initialize the datagram configuration
 	if s.config.EnableDatagrams {
 		s.MaxDatagramFrameSize = protocol.MaxDatagramFrameSize
-		s.datagramQueue = newDatagramQueue(s.scheduleSending, s.logger)
-		s.packetBuffer = NewPacketBuffer()
+		s.datagramQueue = newDatagramQueue(s, s.scheduleSending, s.logger)
+		s.packetBuffer = NewPacketBuffer(s)
 		s.sequenceID = 0
 		s.nextIsStart = false
 		s.currentBlockSize = 0
@@ -772,7 +835,36 @@ func (s *session) handleRstStreamFrame(frame *wire.RstStreamFrame) error {
 
 func (s *session) handleAckFrame(frame *wire.AckFrame) error {
 	pth := s.paths[frame.PathID]
-	err := pth.sentPacketHandler.ReceivedAck(frame, pth.lastRcvdPacketNumber, pth.lastNetworkActivityTime)
+	ackedPackets, err := pth.sentPacketHandler.ReceivedAck(frame, pth.lastRcvdPacketNumber, pth.lastNetworkActivityTime)
+	if ackedPackets == nil {
+		fmt.Println("No acked packets")
+	}
+
+	// 如果数据包中包含 DatagramFrame，更新 PacketInfo 的 Processed 字段
+	for _, packetElement := range ackedPackets {
+		//fmt.Println("Received ACK for DatagramFrame")
+		if packetElement == nil {
+			//fmt.Println("packetElement is nil")
+			break
+		}
+		for _, frame := range packetElement.Value.GetFramesForACK() {
+			switch f := frame.(type) {
+			case *wire.DatagramFrame:
+				fmt.Println("Received ACK for DatagramFrame 2")
+				packetInfo, erro := s.packetBuffer.GetPacketInfoByFrame(f)
+				fmt.Println("Received ACK for DatagramFrame 3")
+				if erro == nil {
+					packetInfo.Processed = true
+					s.packetBuffer.Refreshinfonolog(f, packetInfo)
+					fmt.Printf("Received ACK for DatagramFrame with SequenceID: %d\n", packetInfo.BlockSequenceID)
+				}
+			default:
+				continue
+			}
+		}
+	}
+
+	fmt.Println("Received ACK for DatagramFrame after loop")
 	if err == nil && pth.rttStats.SmoothedRTT() > s.rttStats.SmoothedRTT() {
 		// Update the session RTT, which comes to take the max RTT on all paths
 		s.rttStats.UpdateSessionRTT(pth.rttStats.SmoothedRTT())
