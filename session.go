@@ -20,6 +20,11 @@ import (
 	"github.com/123131513/newquic/qerr"
 )
 
+const (
+	retransmissiontimeout = 100 * time.Millisecond
+	clearBlocktimeout     = 300 * time.Millisecond
+)
+
 type unpacker interface {
 	Unpack(publicHeaderBinary []byte, hdr *wire.PublicHeader, data []byte) (*unpackedPacket, error)
 }
@@ -101,12 +106,12 @@ func (pb *PacketBuffer) AddPacket(frame *wire.DatagramFrame, info PacketInfo) {
 
 	fmt.Println("AddPacket  2")
 	if info.IsEnd {
-		timer := time.AfterFunc(10000*time.Millisecond, func() {
+		timer := time.AfterFunc(clearBlocktimeout, func() {
 			pb.clearBlock(info.BlockSequenceID)
 		})
 		pb.timers[info.BlockSequenceID] = timer
-		retranstimers := time.AfterFunc(80*time.Millisecond, func() {
-			pb.RetransmissionBlock(info.BlockSequenceID)
+		retranstimers := time.AfterFunc(retransmissiontimeout, func() {
+			//pb.RetransmissionBlock(info.BlockSequenceID)
 		})
 		pb.retranstimers[info.BlockSequenceID] = retranstimers
 	}
@@ -199,7 +204,20 @@ func (pb *PacketBuffer) RetransmissionBlock(blockSequenceID int) {
 				fmt.Printf("Frame not found in data_buffer for SequenceID: %d\n", seqID)
 				continue
 			}
-			pb.s.datagramQueue.AddToRetransmissionQueue(frame)
+			err := pb.s.datagramQueue.AddToRetransmissionQueue(frame)
+			if err != nil {
+				_, ok := err.(*TimeoutError)
+				for ok {
+					fmt.Printf("Timeout error occurred for BlockSequenceID: %d\n", blockSequenceID)
+					// 进一步处理超时错误
+					time.Sleep(1 * time.Millisecond) // 休眠1毫秒
+					err = pb.s.datagramQueue.AddToRetransmissionQueue(frame)
+					if err != nil {
+						break
+					}
+					_, ok = err.(*TimeoutError)
+				}
+			}
 			fmt.Printf(" Retransmission block with BlockSequenceID: %d\n", blockSequenceID)
 			info.Processed = true
 		}
@@ -860,6 +878,9 @@ func (s *session) handleAckFrame(frame *wire.AckFrame) error {
 				}
 			default:
 				continue
+			}
+			if frame == nil {
+				break
 			}
 		}
 	}

@@ -33,6 +33,11 @@ type datagramQueue struct {
 	receivedDataHashes map[string]struct{}
 }
 
+// zzh: 定义超时错误
+type TimeoutError struct {
+	Message string
+}
+
 func newDatagramQueue(s *session, hasData func(), logger utils.Logger) *datagramQueue {
 	return &datagramQueue{
 		hasData:                hasData,
@@ -95,7 +100,7 @@ func (h *datagramQueue) AddToRetransmissionQueue(f *wire.DatagramFrame) error {
 			}
 		}
 		// h.mu.Unlock()
-		return nil
+		return &TimeoutError{Message: "AddToRetransmissionQueue timed out"}
 	case <-h.closed:
 		// h.mu.Unlock()
 		return h.closeErr
@@ -121,7 +126,7 @@ func (h *datagramQueue) AddToRetransmissionQueue(f *wire.DatagramFrame) error {
 			}
 		}
 		// h.mu.Unlock()
-		return nil
+		return &TimeoutError{Message: "AddToRetransmissionQueue timed out"}
 	case <-h.closed:
 		// h.mu.Unlock()
 		return h.closeErr
@@ -154,12 +159,12 @@ func (h *datagramQueue) HandleDatagramFrame(f *wire.DatagramFrame) {
 	// 检查该数据的哈希值是否已存在于已接收的哈希集合中
 	if _, exists := h.receivedDataHashes[dataHash]; exists {
 		// 如果已经接收过该数据，忽略该数据帧
-		fmt.Printf("Duplicate frame detected with data hash: %x, ignoring\n", dataHash)
+		// fmt.Printf("Duplicate frame detected with data hash: %x, ignoring\n", dataHash)
 		return
 	}
 
 	// 如果是新的帧，处理并加入到历史记录
-	fmt.Printf("Handling new frame with data hash: %x\n", dataHash)
+	// fmt.Printf("Handling new frame with data hash: %x\n", dataHash)
 
 	// 将该数据的哈希值加入到历史记录中
 	h.receivedDataHashes[dataHash] = struct{}{}
@@ -193,4 +198,9 @@ func (h *datagramQueue) CloseWithError(e error) {
 func hashData(data []byte) string {
 	hash := sha256.Sum256(data)
 	return fmt.Sprintf("%x", hash) // 返回十六进制的哈希字符串
+}
+
+// zzh: 定义超时错误
+func (e *TimeoutError) Error() string {
+	return e.Message
 }
